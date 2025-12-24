@@ -1,168 +1,65 @@
 const express = require('express');
-const bcryptjs = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const pool = require('../config/db');
-const { JWT_SECRET, authenticateToken } = require('../middleware/auth');
+const cors = require('cors');
+const pool = require('./config/db');
 
-const router = express.Router();
+// Route Imports
+const authRoutes = require('./routes/auth');
+const tenantRoutes = require('./routes/tenants');
+const userRoutes = require('./routes/users');
+const projectRoutes = require('./routes/projects');
+const taskRoutes = require('./routes/tasks');
+
+const app = express();
 
 /**
- * API 1: Tenant Registration
- * Implements database transactions for atomic creation.
+ * CORS Configuration
+ * Requirement: Allow requests from the frontend container/URL.
  */
-router.post('/register-tenant', async (req, res) => {
-  const client = await pool.connect();
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
+
+app.use(express.json());
+
+/**
+ * MANDATORY: Health Check Endpoint
+ * Requirement: Returns status code 200 and system/DB status.
+ * Used by automated evaluation scripts to verify the system is ready.
+ */
+app.get('/api/health', async (req, res) => {
   try {
-    const { tenantName, subdomain, adminEmail, adminPassword, adminFullName } = req.body;
-
-    if (!tenantName || !subdomain || !adminEmail || !adminPassword || !adminFullName) {
-      return res.status(400).json({ success: false, message: 'Missing required fields' });
-    }
-
-    await client.query('BEGIN');
-
-    const tenantRes = await client.query(
-      'INSERT INTO public.tenants (name, subdomain, subscription_plan, max_users, max_projects) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-      [tenantName, subdomain, 'free', 5, 3]
-    );
-    const tenantId = tenantRes.rows[0].id;
-
-    const hashedPassword = await bcryptjs.hash(adminPassword, 10);
-    const userRes = await client.query(
-      'INSERT INTO public.users (tenant_id, email, password_hash, full_name, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, full_name, role, tenant_id',
-      [tenantId, adminEmail, hashedPassword, adminFullName, 'tenant_admin']
-    );
-
-    await client.query('COMMIT');
-
-    const user = userRes.rows[0];
-    res.status(201).json({
-      success: true,
-      message: 'Tenant registered successfully',
-      data: {
-        tenantId: tenantId,
-        subdomain: subdomain,
-        adminUser: {
-          id: user.id,
-          email: user.email,
-          fullName: user.full_name,
-          role: user.role
-        }
-      }
+    // Verify database connectivity
+    await pool.query('SELECT 1');
+    res.status(200).json({ 
+      success: true, 
+      status: "ok", 
+      database: "connected" 
     });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    if (err.code === '23505') {
-      return res.status(409).json({ success: false, message: 'Subdomain or email already exists' });
-    }
-    res.status(500).json({ success: false, message: 'Registration failed' });
-  } finally {
-    client.release();
+    res.status(500).json({ 
+      success: false, 
+      status: "error", 
+      database: "disconnected" 
+    });
   }
 });
 
 /**
- * API 2: User Login
- * Supports multi-tenancy via subdomain identification.
+ * API Route Registration
+ * Requirement: Covers all 19 mandatory API endpoints.
  */
-router.post('/login', async (req, res) => {
-  try {
-    const { email, password, tenantSubdomain } = req.body;
-
-    if (!email || !password || !tenantSubdomain) {
-      return res.status(400).json({ success: false, message: 'Email, password, and subdomain required' });
-    }
-
-    const query = `
-      SELECT u.*, t.status as tenant_status 
-      FROM public.users u 
-      JOIN public.tenants t ON u.tenant_id = t.id 
-      WHERE u.email = $1 AND t.subdomain = $2
-    `;
-    const userRes = await pool.query(query, [email, tenantSubdomain]);
-
-    if (userRes.rows.length === 0) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-
-    const user = userRes.rows[0];
-
-    if (user.tenant_status !== 'active') {
-      return res.status(403).json({ success: false, message: 'Account suspended or inactive' });
-    }
-
-    const isPasswordValid = await bcryptjs.compare(password, user.password_hash);
-    if (!isPasswordValid) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign(
-      { id: user.id, tenant_id: user.tenant_id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    res.json({
-      success: true,
-      data: {
-        user: {
-          id: user.id,
-          email: user.email,
-          fullName: user.full_name,
-          role: user.role,
-          tenantId: user.tenant_id
-        },
-        token,
-        expiresIn: 86400
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, message: 'Login failed' });
-  }
-});
+app.use('/api/auth', authRoutes);     // APIs 1-4: Registration, Login, Logout, Me
+app.use('/api/tenants', tenantRoutes); // APIs 5-7: Tenant Management
+app.use('/api/users', userRoutes);     // APIs 8-11: User Management
+app.use('/api/projects', projectRoutes); // APIs 12-15: Project Management
+app.use('/api/tasks', taskRoutes);       // APIs 16-19: Task Management
 
 /**
- * API 3: Get Current User
- * Returns session context for the frontend.
+ * Server Initialization
+ * Port 5000 is mandatory for the backend service.
  */
-router.get('/me', authenticateToken, async (req, res) => {
-  try {
-    const query = `
-      SELECT u.id, u.email, u.full_name, u.role, u.is_active,
-             t.id as tenant_id, t.name as tenant_name, t.subdomain, t.subscription_plan
-      FROM public.users u
-      LEFT JOIN public.tenants t ON u.tenant_id = t.id
-      WHERE u.id = $1
-    `;
-    const userRes = await pool.query(query, [req.user.id]);
-
-    if (userRes.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    const row = userRes.rows[0];
-    res.json({
-      success: true,
-      data: {
-        id: row.id,
-        email: row.email,
-        fullName: row.full_name,
-        role: row.role,
-        isActive: row.is_active,
-        tenant: row.tenant_id ? {
-          id: row.tenant_id,
-          name: row.tenant_name,
-          subdomain: row.subdomain,
-          subscriptionPlan: row.subscription_plan
-        } : null
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
-
-module.exports = router;
