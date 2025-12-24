@@ -6,87 +6,141 @@ const { JWT_SECRET } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Register: Create tenant + user
-router.post('/register', async (req, res) => {
+/**
+ * MANDATORY: Health Check Endpoint
+ * Returns system and database connection status.
+ */
+router.get('/health', async (req, res) => {
   try {
-    const { tenantName, email, password, name } = req.body;
-
-    if (!tenantName || !email || !password || !name) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    // Hash password
-    const hashedPassword = await bcryptjs.hash(password, 10);
-
-    // Create tenant
-    const tenantRes = await pool.query(
-      'INSERT INTO public.tenants (name, subscription_plan) VALUES ($1, $2) RETURNING id',
-      [tenantName, 'free']
-    );
-    const tenantId = tenantRes.rows[0].id;
-
-    // Create user as tenant_admin
-    const userRes = await pool.query(
-      'INSERT INTO public.users (tenant_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, name, role, tenant_id',
-      [tenantId, name, email, hashedPassword, 'tenant_admin']
-    );
-    const user = userRes.rows[0];
-
-    // Generate JWT
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, tenant_id: user.tenant_id },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    res.json({ message: 'Registered successfully', token, user });
+    await pool.query('SELECT 1');
+    res.status(200).json({ 
+      success: true, 
+      status: "ok", 
+      database: "connected" 
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Registration failed' });
+    res.status(500).json({ 
+      success: false, 
+      status: "error", 
+      database: "disconnected" 
+    });
   }
 });
 
-// Login
+/**
+ * API 1: Tenant Registration
+ * Uses a transaction to ensure both tenant and admin user are created together.
+ */
+router.post('/register-tenant', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { tenantName, subdomain, adminEmail, adminPassword, adminFullName } = req.body;
+
+    if (!tenantName || !subdomain || !adminEmail || !adminPassword || !adminFullName) {
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    await client.query('BEGIN'); // Start transaction
+
+    // Create tenant with default 'free' plan limits
+    const tenantRes = await client.query(
+      'INSERT INTO public.tenants (name, subdomain, subscription_plan, max_users, max_projects) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [tenantName, subdomain, 'free', 5, 3]
+    );
+    const tenantId = tenantRes.rows[0].id;
+
+    // Hash password and create admin user
+    const hashedPassword = await bcryptjs.hash(adminPassword, 10);
+    const userRes = await client.query(
+      'INSERT INTO public.users (tenant_id, email, password_hash, full_name, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, full_name, role, tenant_id',
+      [tenantId, adminEmail, hashedPassword, adminFullName, 'tenant_admin']
+    );
+
+    await client.query('COMMIT'); // Commit both operations
+
+    const user = userRes.rows[0];
+    res.status(201).json({
+      success: true,
+      message: 'Tenant registered successfully',
+      data: {
+        tenantId: tenantId,
+        subdomain: subdomain,
+        adminUser: user
+      }
+    });
+  } catch (err) {
+    await client.query('ROLLBACK'); // Rollback on any failure
+    console.error(err);
+    if (err.code === '23505') {
+      return res.status(409).json({ success: false, message: 'Subdomain or email already exists' });
+    }
+    res.status(500).json({ success: false, message: 'Registration failed' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * API 2: User Login
+ * Implements token generation with a 24-hour expiry.
+ */
 router.post('/login', async (req, res) => {
   try {
-    const { email, password, tenant_id } = req.body;
+    const { email, password, tenantSubdomain } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
+    if (!email || !password || !tenantSubdomain) {
+      return res.status(400).json({ success: false, message: 'Email, password, and subdomain required' });
     }
 
-    // If tenant_id provided, check it; otherwise allow login from any tenant
-    let query = 'SELECT id, email, password_hash, name, role, tenant_id FROM public.users WHERE email = $1';
-    let params = [email];
-
-    if (tenant_id) {
-      query += ' AND tenant_id = $2';
-      params.push(tenant_id);
-    }
-
-    const userRes = await pool.query(query, params);
+    // Verify tenant and user via JOIN to ensure the user belongs to the specific subdomain
+    const query = `
+      SELECT u.*, t.status as tenant_status 
+      FROM public.users u 
+      JOIN public.tenants t ON u.tenant_id = t.id 
+      WHERE u.email = $1 AND t.subdomain = $2
+    `;
+    const userRes = await pool.query(query, [email, tenantSubdomain]);
 
     if (userRes.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
     const user = userRes.rows[0];
-    const isPasswordValid = await bcryptjs.compare(password, user.password_hash);
 
-    if (!isPasswordValid) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+    // Check if tenant is active
+    if (user.tenant_status !== 'active') {
+      return res.status(403).json({ success: false, message: 'Account suspended or inactive' });
     }
 
+    const isPasswordValid = await bcryptjs.compare(password, user.password_hash);
+    if (!isPasswordValid) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    // Generate JWT containing userId, tenantId, and role
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, tenant_id: user.tenant_id },
+      { id: user.id, tenant_id: user.tenant_id, role: user.role },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
 
-    res.json({ message: 'Logged in successfully', token, user });
+    res.json({
+      success: true,
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          fullName: user.full_name,
+          role: user.role,
+          tenantId: user.tenant_id
+        },
+        token,
+        expiresIn: 86400
+      }
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Login failed' });
+    res.status(500).json({ success: false, message: 'Login failed' });
   }
 });
 
