@@ -3,33 +3,37 @@ version: '3.8'
 services:
   backend:
     build: ./backend
-    container_name: saas-backend
+    container_name: backend
     ports:
-      - "5001:5001"
+      - "5000:5000"
     environment:
-      - PORT=5001
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
-      - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
-      - DB_DATABASE=${DB_DATABASE}
-      - JWT_SECRET=${JWT_SECRET}
+      - PORT=5000
+      - DB_HOST=database
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_DATABASE=multi_tenant_saas
+      - JWT_SECRET=${JWT_SECRET:-supersecretkey123}
+      - FRONTEND_URL=http://frontend:3000
     depends_on:
-      - db
+      database:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
     build: ./frontend
-    container_name: saas-frontend
+    container_name: frontend
     ports:
       - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:5000/api
     depends_on:
       - backend
     restart: unless-stopped
 
-  db:
+  database:
     image: postgres:15
-    container_name: saas-postgres
+    container_name: database
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -38,6 +42,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
 volumes:
